@@ -1,13 +1,21 @@
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+import hashlib
+import hmac
+import json
 from pathlib import Path
 from typing import Any
+from uuid import UUID
 
 import pytest
 from fastapi.testclient import TestClient
 
 from codefactory.app import create_app
+from codefactory.github import GitHubConfig
+
+
+TOKEN = "test-bearer-token-0001"
+OTHER_TOKEN = "test-bearer-token-0002"
 
 
 def task_payload(**overrides: Any) -> dict[str, Any]:
@@ -20,28 +28,25 @@ def task_payload(**overrides: Any) -> dict[str, Any]:
     return payload
 
 
-def admit(client: TestClient, **overrides: Any) -> dict[str, Any]:
-    response = client.post("/tasks", json=task_payload(**overrides))
-    assert response.status_code in (200, 201), response.text
-    return response.json()
-
-
-def transition(
-    client: TestClient,
-    task_id: Any,
-    state: str,
-    expected_state: str,
-) -> Any:
-    return client.post(
-        f"/tasks/{task_id}/transition",
-        json={"state": state, "expected_state": expected_state},
-    )
-
-
 @pytest.fixture
 def client(tmp_path: Path):
-    with TestClient(create_app(db_path=tmp_path / "factory.sqlite3")) as test_client:
+    with TestClient(
+        create_app(
+            db_path=tmp_path / "factory.sqlite3",
+            auth_tokens={TOKEN: "github:alice", OTHER_TOKEN: "github:bob"},
+        )
+    ) as test_client:
         yield test_client
+
+
+def auth(token: str = TOKEN) -> dict[str, str]:
+    return {"Authorization": f"Bearer {token}"}
+
+
+def create(client: TestClient, **overrides: Any) -> dict[str, Any]:
+    response = client.post("/tasks", json=task_payload(**overrides), headers=auth())
+    assert response.status_code == 201, response.text
+    return response.json()
 
 
 @pytest.mark.parametrize(
@@ -51,164 +56,153 @@ def client(tmp_path: Path):
         {"repository": "acme"},
         {"repository": "/widget"},
         {"repository": "acme/"},
+        {"repository": "acme /widget"},
         {"issue_number": 0},
         {"issue_number": -1},
         {"title": " \n "},
+        {"trusted": True},
     ],
 )
-def test_create_rejects_invalid_task_fields(client: TestClient, overrides: dict[str, Any]):
-    response = client.post("/tasks", json=task_payload(**overrides))
-
+def test_create_rejects_invalid_or_trust_bypassing_fields(client: TestClient, overrides: dict[str, Any]):
+    response = client.post("/tasks", json=task_payload(**overrides), headers=auth())
     assert response.status_code == 422
 
 
-def test_admission_is_idempotent_and_survives_app_recreation(tmp_path: Path):
-    db_path = tmp_path / "factory.sqlite3"
-    with TestClient(create_app(db_path=db_path)) as client:
-        created = admit(client, trusted=True)
-        assert created["trusted"] is True
-        assert created["state"] == "TRIAGE"
+def test_health_is_public_but_task_routes_require_auth_and_fail_closed_when_unconfigured(tmp_path: Path):
+    with TestClient(create_app(db_path=tmp_path / "no-auth.sqlite3", auth_tokens={})) as client:
+        assert client.get("/health").status_code == 200
+        assert client.get("/tasks").status_code == 503
+        assert client.post("/tasks", json=task_payload()).status_code == 503
 
-        advanced = transition(client, created["id"], "PLAN", "TRIAGE")
-        assert advanced.status_code == 200
+    with TestClient(create_app(db_path=tmp_path / "auth.sqlite3", auth_tokens={TOKEN: "github:alice"})) as client:
+        assert client.get("/tasks").status_code == 401
+        assert client.get("/tasks", headers=auth("invalid-token-000000")).status_code == 401
 
-        duplicate = client.post("/tasks", json=task_payload(trusted=True))
-        assert duplicate.status_code == 200
-        assert duplicate.json()["id"] == created["id"]
 
-        first_events = client.get(f"/tasks/{created['id']}/events")
-        assert first_events.status_code == 200
-        assert [event["event_type"] for event in first_events.json()] == [
-            "created",
-            "transitioned",
-        ]
-        assert [row["id"] for row in client.get("/tasks").json()] == [created["id"]]
+def test_auth_token_file_must_be_user_owned_and_private(tmp_path: Path):
+    path = tmp_path / "tokens.json"
+    path.write_text(json.dumps({TOKEN: "github:alice"}), encoding="utf-8")
+    path.chmod(0o644)
+    with pytest.raises(ValueError, match="mode 0600"):
+        create_app(db_path=tmp_path / "factory.sqlite3", auth_tokens_file=path)
 
-    with TestClient(create_app(db_path=db_path)) as restarted_client:
-        fetched = restarted_client.get(f"/tasks/{created['id']}")
-        assert fetched.status_code == 200
-        assert fetched.json()["state"] == "PLAN"
 
-        duplicate_after_restart = restarted_client.post(
-            "/tasks", json=task_payload(trusted=True)
+def test_manual_tasks_are_untrusted_idempotent_and_owned(client: TestClient):
+    first = create(client)
+    assert first["trusted"] is False
+    assert first["owner_principal"] == "github:alice"
+    duplicate = client.post("/tasks", json=task_payload(), headers=auth())
+    assert duplicate.status_code == 201
+    assert duplicate.json()["id"] == first["id"]
+    assert client.get("/tasks", headers=auth()).json()[0]["id"] == first["id"]
+    assert client.get(f"/tasks/{first['id']}", headers=auth(OTHER_TOKEN)).status_code == 404
+    assert client.get(f"/tasks/{first['id']}/events", headers=auth(OTHER_TOKEN)).status_code == 404
+    assert client.get(f"/tasks/{first['id']}/messages", headers=auth(OTHER_TOKEN)).status_code == 404
+
+
+def test_no_generic_transition_endpoint_and_approvals_are_explicit(client: TestClient):
+    task = create(client)
+    assert client.post(
+        f"/tasks/{task['id']}/transition",
+        json={"state": "BUILD", "expected_state": "TRIAGE"},
+        headers=auth(),
+    ).status_code == 404
+    assert client.post(
+        f"/tasks/{task['id']}/approve-plan",
+        json={"plan_version": 1, "approved": True},
+        headers=auth(),
+    ).status_code == 409
+
+
+def test_signed_github_issue_admission_is_allowlisted_labeled_owned_and_deduplicated(tmp_path: Path):
+    secret = "webhook-test-secret"
+    config = GitHubConfig(
+        allowed_repositories=frozenset({"acme/widget"}),
+        admission_label="factory:ready",
+        webhook_secret=secret,
+    )
+    with TestClient(
+        create_app(
+            db_path=tmp_path / "github.sqlite3",
+            auth_tokens={TOKEN: "github:alice"},
+            github_config=config,
         )
-        assert duplicate_after_restart.status_code == 200
-        assert duplicate_after_restart.json()["id"] == created["id"]
-        assert len(restarted_client.get(f"/tasks/{created['id']}/events").json()) == 2
+    ) as client:
+        delivery_id = "6ef96ed8-0c6a-4b09-9532-fba1c3a9449b"
+        payload = {
+            "action": "opened",
+            "repository": {"full_name": "acme/widget"},
+            "issue": {
+                "number": 44,
+                "title": "A labeled issue",
+                "body": "Issue body",
+                "labels": [{"name": "factory:ready"}],
+                "user": {"login": "Alice"},
+            },
+        }
+        raw = json.dumps(payload, separators=(",", ":")).encode()
+        signature = "sha256=" + hmac.new(secret.encode(), raw, hashlib.sha256).hexdigest()
+        headers = {
+            "X-Hub-Signature-256": signature,
+            "X-GitHub-Event": "issues",
+            "X-GitHub-Delivery": delivery_id,
+        }
+        first = client.post("/webhooks/github", content=raw, headers=headers)
+        assert first.status_code == 202, first.text
+        assert first.json()["accepted"] is True
+        task = first.json()["task"]
+        assert task["trusted"] is True
+        assert task["owner_principal"] == "github:alice"
+        replay = client.post("/webhooks/github", content=raw, headers=headers)
+        assert replay.status_code == 202
+        assert replay.json()["duplicate"] is True
+        assert [item["id"] for item in client.get("/tasks", headers=auth()).json()] == [task["id"]]
+        owner_client_task = client.get(f"/tasks/{task['id']}", headers=auth())
+        assert owner_client_task.status_code == 200
+        assert len(client.get(f"/tasks/{task['id']}/events", headers=auth()).json()) == 1
 
 
-def test_untrusted_task_cannot_advance_and_rejections_do_not_add_events(client: TestClient):
-    task = admit(client)
-    assert task["trusted"] is False
-    task_id = task["id"]
-
-    blocked = transition(client, task_id, "PLAN", "TRIAGE")
-    assert blocked.status_code == 409
-    assert client.get(f"/tasks/{task_id}").json()["state"] == "TRIAGE"
-    events = client.get(f"/tasks/{task_id}/events").json()
-    assert [event["event_type"] for event in events] == ["created"]
-
-
-def test_transition_replays_are_idempotent_and_stale_or_invalid_moves_are_atomic(
-    client: TestClient,
-):
-    task = admit(client, trusted=True)
-    task_id = task["id"]
-
-    first = transition(client, task_id, "PLAN", "TRIAGE")
-    assert first.status_code == 200, first.text
-    assert first.json()["state"] == "PLAN"
-    event_count = len(client.get(f"/tasks/{task_id}/events").json())
-    assert event_count == 2
-
-    # Replaying the committed request and requesting the current state are both no-ops.
-    replay = transition(client, task_id, "PLAN", "TRIAGE")
-    assert replay.status_code == 200, replay.text
-    same_state = transition(client, task_id, "PLAN", "PLAN")
-    assert same_state.status_code == 200, same_state.text
-    assert len(client.get(f"/tasks/{task_id}/events").json()) == event_count
-
-    stale = transition(client, task_id, "BUILD", "TRIAGE")
-    invalid_edge = transition(client, task_id, "CI", "PLAN")
-    assert stale.status_code == 409
-    assert invalid_edge.status_code == 409
-    assert client.get(f"/tasks/{task_id}").json()["state"] == "PLAN"
-    assert len(client.get(f"/tasks/{task_id}/events").json()) == event_count
+def test_webhook_signature_is_verified_and_invalid_delivery_is_not_admitted(tmp_path: Path):
+    config = GitHubConfig(
+        allowed_repositories=frozenset({"acme/widget"}),
+        webhook_secret="secret",
+    )
+    with TestClient(create_app(db_path=tmp_path / "github.sqlite3", auth_tokens={TOKEN: "github:alice"}, github_config=config)) as client:
+        raw = b'{"action":"opened"}'
+        response = client.post(
+            "/webhooks/github",
+            content=raw,
+            headers={
+                "X-Hub-Signature-256": "sha256=" + "0" * 64,
+                "X-GitHub-Event": "issues",
+                "X-GitHub-Delivery": str(UUID(int=1)),
+            },
+        )
+        assert response.status_code == 401
+        assert client.get("/tasks", headers=auth()).json() == []
 
 
-def test_trusted_workflow_and_review_loops_are_recorded_in_order(client: TestClient):
-    task = admit(client, trusted=True)
-    task_id = task["id"]
-    states = [
-        "PLAN",
-        "PLAN_REVIEW",
-        "PLAN",  # planner revises after review
-        "PLAN_REVIEW",
-        "HUMAN_PLAN_APPROVAL",
-        "BUILD",
-        "CODE_REVIEW",
-        "BUILD",  # implementer fixes review findings
-        "CODE_REVIEW",
-        "CI",
-    ]
-    current = "TRIAGE"
-    for next_state in states:
-        response = transition(client, task_id, next_state, current)
-        assert response.status_code == 200, response.text
-        assert response.json()["state"] == next_state
-        current = next_state
-
-    assert client.get(f"/tasks/{task_id}").json()["state"] == "CI"
-    events = client.get(f"/tasks/{task_id}/events").json()
-    assert [(event["from_state"], event["to_state"]) for event in events] == [
-        (None, "TRIAGE"),
-        *list(zip(["TRIAGE", *states[:-1]], states)),
-    ]
-    assert [event["event_type"] for event in events] == ["created"] + [
-        "transitioned"
-    ] * len(states)
+def test_user_message_requires_owner_and_is_persisted(client: TestClient):
+    task = create(client)
+    response = client.post(
+        f"/tasks/{task['id']}/messages",
+        json={"content": "Please proceed"},
+        headers=auth(OTHER_TOKEN),
+    )
+    assert response.status_code == 404
+    response = client.post(
+        f"/tasks/{task['id']}/messages",
+        json={"content": "Please proceed"},
+        headers=auth(),
+    )
+    assert response.status_code == 202  # queued, but trusted admission is still required to run it
 
 
-def test_missing_task_reads_and_transitions_return_404(client: TestClient):
-    task = admit(client)
-    missing_id = task["id"] + 1_000_000 if isinstance(task["id"], int) else "missing-task"
-
-    assert client.get(f"/tasks/{missing_id}").status_code == 404
-    assert client.get(f"/tasks/{missing_id}/events").status_code == 404
-    assert transition(client, missing_id, "PLAN", "TRIAGE").status_code == 404
-
-
-def test_concurrent_admission_and_transition_across_app_instances_are_idempotent(
-    tmp_path: Path,
-):
-    db_path = tmp_path / "shared.sqlite3"
-    with (
-        TestClient(create_app(db_path=db_path)) as first_client,
-        TestClient(create_app(db_path=db_path)) as second_client,
-        ThreadPoolExecutor(max_workers=2) as executor,
-    ):
-        clients = [first_client, second_client]
-        create_futures = [
-            executor.submit(client.post, "/tasks", json=task_payload()) for client in clients
-        ]
-        create_responses = [future.result() for future in create_futures]
-        assert sorted(response.status_code for response in create_responses) == [200, 201]
-        created_ids = {response.json()["id"] for response in create_responses}
-        assert len(created_ids) == 1
-        task_id = created_ids.pop()
-        assert len(first_client.get(f"/tasks/{task_id}/events").json()) == 1
-
-        trusted_payload = task_payload(issue_number=18, trusted=True)
-        trusted_task = first_client.post("/tasks", json=trusted_payload).json()
-        transition_futures = [
-            executor.submit(transition, client, trusted_task["id"], "PLAN", "TRIAGE")
-            for client in clients
-        ]
-        transition_responses = [future.result() for future in transition_futures]
-        assert [response.status_code for response in transition_responses] == [200, 200]
-        assert all(response.json()["state"] == "PLAN" for response in transition_responses)
-        events = first_client.get(f"/tasks/{trusted_task['id']}/events").json()
-        assert [(event["from_state"], event["to_state"]) for event in events] == [
-            (None, "TRIAGE"),
-            ("TRIAGE", "PLAN"),
-        ]
+def test_cancel_is_owner_scoped_and_persisted(client: TestClient):
+    task = create(client)
+    assert client.post(f"/tasks/{task['id']}/cancel", headers=auth(OTHER_TOKEN)).status_code == 404
+    cancelled = client.post(f"/tasks/{task['id']}/cancel", headers=auth())
+    assert cancelled.status_code == 200
+    assert cancelled.json()["state"] == "CANCELLED"
+    events = client.get(f"/tasks/{task['id']}/events", headers=auth()).json()
+    assert events[-1]["event_type"] == "task_cancelled"

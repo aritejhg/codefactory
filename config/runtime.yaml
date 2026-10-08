@@ -1,0 +1,29 @@
+# Paths are operator-controlled. Keep credential files outside every checkout.
+repositories:
+  aritejhg/codefactory: ~/codefactory
+worktree_root: ~/.local/state/codefactory/task-worktrees
+github_token_file: ~/.config/codefactory/bootstrap/github.token
+poll_seconds: 2
+quota_retry_seconds: 900
+base_prompt_file: skills/codefactory/SKILL.md
+roles:
+  triage:
+    backend: codex
+    model: gpt-5.6-luna
+    reasoning_effort: xhigh
+  planner:
+    backend: codex
+    model: gpt-6.1-sol
+    reasoning_effort: xhigh
+  implementer:
+    backend: codex
+    model: gpt-6.1-sol
+    reasoning_effort: xhigh
+  reviewer:
+    backend: claude
+    # Use the exact advertised native Opus ID; do not imply a fixed version.
+    model: opus
+  ci_babysitter:
+    backend: codex
+    model: gpt-5.6-luna
+    reasoning_effort: xhigh

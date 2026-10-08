@@ -59,8 +59,8 @@ _ROLE_MODES = {
     "reviewer": "read-only",
     "triage": "read-only",
     "implementer": "workspace-write",
-    "ci_babysitter": "workspace-write",
-    "ci-babysitter": "workspace-write",
+    "ci_babysitter": "read-only",
+    "ci-babysitter": "read-only",
 }
 _CODEX_CONFIG = {
     "default_permissions": "workspace-only",
@@ -114,6 +114,7 @@ class ACPRemoteError(ACPError):
         super().__init__(f"ACP request {method!r} failed" + (f" ({code})" if code is not None else "") + f": {safe_message}")
         self.method = method
         self.code = code
+        self.remote_message = safe_message
 
 
 @dataclass(frozen=True, slots=True)
@@ -659,7 +660,7 @@ class ACPGateway:
         normalized_config = self._role_config(role, config)
         result = await self._rpc_request(
             "session/new",
-            {"cwd": normalized_cwd, "mcpServers": []},
+            self._session_params(normalized_cwd),
         )
         session_id = result.get("sessionId")
         if not isinstance(session_id, str) or not session_id:
@@ -709,7 +710,7 @@ class ACPGateway:
         normalized_config = self._role_config(role, config)
         result = await self._rpc_request(
             "session/load",
-            {"sessionId": session_id, "cwd": normalized_cwd, "mcpServers": []},
+            {"sessionId": session_id, **self._session_params(normalized_cwd)},
         )
         config_options = result.get("configOptions", [])
         if not isinstance(config_options, list):
@@ -727,6 +728,10 @@ class ACPGateway:
         )
         self._sessions[session_id] = session
         return session
+
+    @staticmethod
+    def _session_params(cwd: str) -> dict[str, Any]:
+        return {"cwd": cwd, "mcpServers": []}
 
     @staticmethod
     def _validate_config(config: Mapping[str, Any] | None) -> dict[str, Any]:
@@ -754,13 +759,11 @@ class ACPGateway:
             "reasoning_effort": _DEFAULT_REASONING_EFFORT,
             "mode": expected_mode,
         }
+        requested_mode = normalized.get("mode", expected_mode)
+        if requested_mode != expected_mode:
+            raise ACPConfigurationError(f"role {role!r} requires ACP mode={expected_mode!r}")
         for key, expected in expected_values.items():
-            requested = normalized.get(key)
-            if requested is not None and requested != expected:
-                raise ACPConfigurationError(
-                    f"role {role!r} requires ACP {key}={expected!r}"
-                )
-            normalized[key] = expected
+            normalized.setdefault(key, expected)
         return normalized
 
     async def _apply_config(

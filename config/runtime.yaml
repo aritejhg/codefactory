@@ -5,6 +5,8 @@ worktree_root: ~/.local/state/codefactory/task-worktrees
 github_token_file: ~/.config/codefactory/bootstrap/github.token
 poll_seconds: 2
 quota_retry_seconds: 900
+max_concurrent_agents: 5
+max_open_prs: 5
 base_prompt_file: skills/codefactory/SKILL.md
 roles:
   triage:

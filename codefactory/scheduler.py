@@ -13,14 +13,15 @@ from collections.abc import Awaitable, Callable, Mapping
 from pathlib import Path
 from typing import Any
 
-from .acp import ACPEvent, ACPGateway, ACPRemoteError
+from .acp import ACPEvent, ACPGateway, ACPRemoteError, ACPProtocolError, ACPTimeoutError
+from .roles import DEFAULT_RESOURCE_LIMIT, resource_limit
 from .native import RoleUnavailable
 from .workflow import TaskState, WorkflowError, WorkflowService, role_for_state
 
 
 JSON_OBJECT_RE = re.compile(r"\A\s*\{.*\}\s*\Z", re.DOTALL)
 DEFAULT_LEASE_SECONDS = 600
-DEFAULT_MAX_ACTIVE_TURNS = 2
+DEFAULT_MAX_ACTIVE_TURNS = DEFAULT_RESOURCE_LIMIT
 DEFAULT_POLL_SECONDS = 2.0
 
 WorkspaceResolver = Callable[[Mapping[str, Any]], str | Path | Awaitable[str | Path]]
@@ -56,8 +57,10 @@ class Scheduler:
         quota_retry_seconds: int = 900,
         review_context: Callable[[Mapping[str, Any], Path], str] | None = None,
         base_prompt: str = "",
+        capacity_policy: Callable[..., bool] | None = None,
     ):
-        if max_active_turns < 1 or lease_seconds < 30 or poll_seconds <= 0:
+        resource_limit(max_active_turns)
+        if lease_seconds < 30 or poll_seconds <= 0:
             raise ValueError("scheduler limits must be positive")
         self.workflow = workflow
         self.store = workflow.store
@@ -74,6 +77,7 @@ class Scheduler:
         self.quota_retry_seconds = max(60, quota_retry_seconds)
         self.review_context = review_context
         self.base_prompt = base_prompt
+        self.capacity_policy = capacity_policy
         self.gateway = gateway or ACPGateway(on_event=self._on_event, on_agent_request=self._on_agent_request)
         self._turn_text: dict[str, list[str]] = defaultdict(list)
         self._stop = asyncio.Event()
@@ -107,6 +111,7 @@ class Scheduler:
                 pass
         if self._started:
             await self.gateway.close()
+            self.workflow.release_worker_turns(self.worker_id)
         self._started = False
 
     async def cancel_task(self, task_id: int) -> None:
@@ -149,13 +154,15 @@ class Scheduler:
         for role in ("triage", "planner", "reviewer", "implementer", "ci_babysitter"):
             if hasattr(self.gateway, "available") and not self.gateway.available(role):
                 continue
-            task = self.workflow.next_task_for_role(role)
+            task = self.workflow.next_task_for_role(role, eligible=(lambda task: self.capacity_policy(task, reserve=False)) if self.capacity_policy else None)
             if task is None:
                 continue
             if role == "implementer" and self.commit_reader is None:
                 continue
             cwd = await self._resolve_workspace(task)
             if cwd is None:
+                continue
+            if self.capacity_policy and not self.capacity_policy(task):
                 continue
             turn_key = self.workflow.claim_turn(
                 task["id"],
@@ -183,6 +190,7 @@ class Scheduler:
 
     async def _execute_turn(self, task: Mapping[str, Any], role: str, cwd: Path, turn_key: str) -> None:
         session = self.workflow.get_session(task["id"], role)
+        native_pending = False
         try:
             if session is not None:
                 if Path(session["cwd"]).expanduser().resolve() != cwd:
@@ -231,7 +239,13 @@ class Scheduler:
             latest_task = self.workflow.get_task(task["id"])
             if latest_task["state"] != current_task["state"] or role_for_state(latest_task) != role:
                 raise _PolicyDenied()
+            if self.capacity_policy and not self.capacity_policy(latest_task):
+                raise _PolicyDenied()
+            if not self.workflow.start_native_turn(turn_key):
+                raise _PolicyDenied()
+            native_pending = True
             await self.gateway.prompt(session["session_id"], prompt)
+            native_pending = False
             answer = "".join(self._turn_text.pop(session["session_id"], []))
             try:
                 outcome = self._parse_outcome(answer)
@@ -262,7 +276,13 @@ class Scheduler:
         except RoleUnavailable:
             self.workflow.finish_turn(turn_key, status="interrupted", error_code="native_role_unavailable")
             return
+        except ACPProtocolError:
+            # A lost transport cannot prove the native turn stopped. Retain its
+            # slot until verified adapter shutdown; restart recovery fails closed.
+            return
         except Exception as exc:
+            if native_pending and not isinstance(exc, (ACPRemoteError, ACPTimeoutError)):
+                return  # No settled response: retain native and feature slots.
             if isinstance(exc, ACPRemoteError) and (exc.code == 429 or self._is_quota_refusal(exc.remote_message)):
                 self.workflow.finish_turn(turn_key, status="interrupted", error_code="native_quota_wait")
                 self.workflow.defer_role(task["id"], role, seconds=self.quota_retry_seconds, reason="native_quota_wait")

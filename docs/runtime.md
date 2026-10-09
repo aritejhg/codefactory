@@ -94,3 +94,5 @@ Recovery validation uses the existing API/workflow/scheduler/ACP checks, one
 meaningful quota/restart regression, and real native smoke/review. A completed
 triage turn or a running health endpoint does not claim complete issue-to-PR
 delivery.
+
+`max_concurrent_agents: 5` and `max_open_prs: 5` configure global native-turn and feature/PR capacity (strict integers 1–100). Dispatch remains serial. Active PRs include drafts and ready PRs; merge/closure frees their slot. Unpublished features reserve one slot across roles/retries/waits. At full PR capacity, only verified linked active-PR work runs; new features remain queued before triage/planning/building. All controllers must share the database and configured limits. `/health.capacity` exposes counts and block reasons; unknown/stale inventory fails closed and bootstrap publication remains disabled. Native-started leases cannot be reaped by expiry alone: abrupt restart or uncertain transport requires operator-verified native shutdown, while graceful scheduler stop releases its own claims after adapter shutdown.

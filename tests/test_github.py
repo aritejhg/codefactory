@@ -349,6 +349,8 @@ def test_draft_review_and_merge_operations_use_validated_api_payloads():
         return httpx.Response(404)
 
     client, _ = make_client(handler)
+    # This test isolates HTTP payloads; capacity invariants have their own tests.
+    client.draft_publication_gate = lambda _client, _repository, _head, _base, publish, **_scope: publish()
     created = client.create_draft_pull_request(
         REPOSITORY, title="Add feature", head="factory/issue-17", base="main", body="Evidence"
     )
@@ -420,3 +422,20 @@ def test_injected_client_cannot_send_credentials_to_arbitrary_origin():
             GitHubClient(config, http_client=unsafe)
     finally:
         unsafe.close()
+
+
+def test_active_pr_inventory_is_complete_and_default_draft_gate_is_closed():
+    pages = []
+    def handler(request):
+        pages.append(int(request.url.params["page"]))
+        if pages[-1] == 1:
+            return httpx.Response(200, json=[pull_request(number=number, draft=number % 2 == 1) for number in range(1, 101)])
+        return httpx.Response(200, json=[pull_request(number=101, draft=False)])
+    client, seen = make_client(handler)
+    pulls = client.list_active_pull_requests(REPOSITORY)
+    assert len(pulls) == 101 and pages == [1, 2]
+    assert any(pull.draft for pull in pulls) and any(not pull.draft for pull in pulls)
+    assert all(request.url.params["state"] == "open" for request in seen)
+    with pytest.raises(GitHubConfigurationError, match="capacity gate"):
+        client.create_draft_pull_request(REPOSITORY, title="Feature", head="feature", base="main")
+    assert len(seen) == 2

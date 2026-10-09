@@ -907,8 +907,10 @@ class WorkflowService:
             if row["state"] == TaskState.CANCELLED.value:
                 return _task(row)
             now = utc_now()
+            if row["pull_number"] is None:
+                db.execute("DELETE FROM feature_slots WHERE task_id = ? AND NOT EXISTS (SELECT 1 FROM agent_turns WHERE task_id = ? AND status = 'claimed' AND native_started = 1)", (task_id, task_id))
             db.execute(
-                "UPDATE agent_turns SET status = 'interrupted', finished_at = ?, error_code = 'owner_cancelled' WHERE task_id = ? AND status = 'claimed'",
+                "UPDATE agent_turns SET status = 'interrupted', finished_at = ?, error_code = 'owner_cancelled' WHERE task_id = ? AND status = 'claimed' AND native_started = 0",
                 (now, task_id),
             )
             db.execute(
@@ -965,19 +967,23 @@ class WorkflowService:
             return self._queue_message(db, task_id, role, direction, content, actor)
 
     def claim_turn(self, task_id: int, role: str, *, worker_id: str, lease_seconds: int, max_active: int) -> str | None:
+        from .roles import resource_limit
+        resource_limit(max_active)
         now = utc_now()
         lease_expires_at = (
             datetime.now(timezone.utc) + timedelta(seconds=lease_seconds)
         ).isoformat(timespec="microseconds")
         with self.store.transaction() as db:
-            db.execute("UPDATE agent_turns SET status = 'interrupted', finished_at = ?, error_code = 'lease_expired' WHERE status = 'claimed' AND lease_expires_at <= ?", (now, now))
+            db.execute("UPDATE agent_turns SET status = 'interrupted', finished_at = ?, error_code = 'lease_expired' WHERE status = 'claimed' AND native_started = 0 AND lease_expires_at <= ?", (now, now))
             active = db.execute("SELECT COUNT(*) AS count FROM agent_turns WHERE status = 'claimed'").fetchone()["count"]
             if active >= max_active:
                 return None
             current = _need_task(db, task_id)
             if not bool(current["trusted"]) or role_for_state(current) != role:
                 return None
-            if db.execute("SELECT 1 FROM agent_turns WHERE task_id = ? AND status = 'claimed' AND lease_expires_at > ?", (task_id, now)).fetchone():
+            if db.execute("SELECT 1 FROM role_pauses WHERE task_id = ? AND role = ? AND retry_after > ?", (task_id, role, now)).fetchone():
+                return None
+            if db.execute("SELECT 1 FROM agent_turns WHERE task_id = ? AND status = 'claimed'", (task_id,)).fetchone():
                 return None
             session = db.execute("SELECT session_id FROM sessions WHERE task_id = ? AND role = ?", (task_id, role)).fetchone()
             session_id = session["session_id"] if session else None
@@ -999,18 +1005,41 @@ class WorkflowService:
                 (session_id, idempotency_key),
             )
 
+    def start_native_turn(self, idempotency_key: str) -> bool:
+        """Fence cancellation immediately before prompting; expiry is no proof of exit."""
+        with self.store.transaction() as db:
+            turn = db.execute("SELECT * FROM agent_turns WHERE idempotency_key = ? AND status = 'claimed'", (idempotency_key,)).fetchone()
+            if turn is None or turn["lease_expires_at"] <= utc_now():
+                return False
+            task = _need_task(db, turn["task_id"])
+            if not bool(task["trusted"]) or role_for_state(task) != turn["role"]:
+                return False
+            db.execute("UPDATE agent_turns SET native_started = 1 WHERE idempotency_key = ?", (idempotency_key,))
+            return True
+
+    def release_worker_turns(self, worker_id: str) -> None:
+        """Call only after this worker's native adapter has stopped."""
+        with self.store.transaction() as db:
+            db.execute("UPDATE agent_turns SET status = 'interrupted', finished_at = ?, error_code = 'worker_stopped' WHERE lease_owner = ? AND status = 'claimed'", (utc_now(), worker_id))
+            self._release_cancelled_features(db)
+
     def finish_turn(self, idempotency_key: str, *, status: str, error_code: str | None = None) -> None:
         if status not in {"completed", "failed", "interrupted"}:
             raise ValueError("invalid agent turn status")
         with self.store.transaction() as db:
             db.execute("UPDATE agent_turns SET status = ?, finished_at = ?, error_code = ? WHERE idempotency_key = ? AND status = 'claimed'", (status, utc_now(), error_code, idempotency_key))
+            self._release_cancelled_features(db)
+
+    @staticmethod
+    def _release_cancelled_features(db) -> None:
+        db.execute("DELETE FROM feature_slots WHERE task_id IN (SELECT id FROM tasks WHERE state = 'CANCELLED' AND pull_number IS NULL) AND NOT EXISTS (SELECT 1 FROM agent_turns WHERE agent_turns.task_id = feature_slots.task_id AND status = 'claimed')")
 
     def recover_expired_turns(self) -> int:
         with self.store.transaction() as db:
-            cursor = db.execute("UPDATE agent_turns SET status = 'interrupted', finished_at = ?, error_code = 'lease_expired' WHERE status = 'claimed' AND lease_expires_at <= ?", (utc_now(), utc_now()))
+            cursor = db.execute("UPDATE agent_turns SET status = 'interrupted', finished_at = ?, error_code = 'lease_expired' WHERE status = 'claimed' AND native_started = 0 AND lease_expires_at <= ?", (utc_now(), utc_now()))
             return cursor.rowcount
 
-    def next_task_for_role(self, role: str) -> dict[str, Any] | None:
+    def next_task_for_role(self, role: str, *, eligible=None) -> dict[str, Any] | None:
         if role not in _ROLE_NAMES:
             raise WorkflowError("unknown agent role", 422)
         now = utc_now()
@@ -1025,14 +1054,14 @@ class WorkflowService:
                    AND NOT EXISTS (
                        SELECT 1 FROM agent_turns active
                        WHERE active.task_id = tasks.id AND active.status = 'claimed'
-                         AND active.lease_expires_at > ?
+                         AND (active.native_started = 1 OR active.lease_expires_at > ?)
                    )
                    ORDER BY priority DESC, created_at, id""",
                 (role, now, now),
             ).fetchall()
         for row in rows:
             task = _task(row)
-            if role_for_state(task) == role:
+            if role_for_state(task) == role and (eligible is None or eligible(task)):
                 return task
         return None
 

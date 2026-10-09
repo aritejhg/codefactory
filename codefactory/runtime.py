@@ -9,6 +9,7 @@ from typing import Any
 
 from .app import _environment_auth_tokens, create_app
 from .credentials import ControllerCredentialError, read_controller_token
+from .capacity import PullRequestCapacity
 from .github import GitHubClient, GitHubConfig
 from .native import NativeRoleGateway
 from .roles import load_config
@@ -23,6 +24,7 @@ class Runtime:
         self.workflow = workflow
         self.store = workflow.store
         self.config = config
+        self.pr_capacity = PullRequestCapacity(self.store, config["repositories"], config.get("max_open_prs", 5))
         self.principal = principal
         self.gateway = NativeRoleGateway(routes, config.get("adapters"))
         prompt_path = Path(os.environ.get("CODEFACTORY_BASE_PROMPT_FILE", config.get("base_prompt_file", "skills/codefactory/SKILL.md"))).expanduser()
@@ -54,7 +56,7 @@ class Runtime:
             token = None
         self.github_config = GitHubConfig(token=token, allowed_repositories=frozenset(config["repositories"]))
         if token and principal:
-            self.github = GitHubClient(self.github_config)
+            self.github = GitHubClient(self.github_config, draft_publication_gate=self.pr_capacity)
             self.github_reason = None
         elif token:
             self.github_reason = "single_operator_principal_not_configured"
@@ -69,6 +71,8 @@ class Runtime:
             poll_seconds=float(config.get("poll_seconds", 2)),
             quota_retry_seconds=int(config.get("quota_retry_seconds", 900)),
             base_prompt=base_prompt,
+            max_active_turns=config.get("max_concurrent_agents", 5),
+            capacity_policy=self.pr_capacity.admit,
         )
         self._ingestion_task = None
         self.running = False
@@ -87,6 +91,7 @@ class Runtime:
     async def _ingest_loop(self):
         while True:
             try:
+                await asyncio.to_thread(self.pr_capacity.refresh, self.github)
                 for repository in self.config["repositories"]:
                     issues = await asyncio.to_thread(self.github.list_admitted_issues, repository)
                     for issue in issues:
@@ -114,6 +119,9 @@ class Runtime:
                 "SELECT task_id, role, reason, retry_after FROM role_pauses WHERE retry_after > ? ORDER BY retry_after", (utc_now(),)
             ).fetchall()
             counts = self.store.db.execute("SELECT state, COUNT(*) AS count FROM tasks GROUP BY state").fetchall()
+            turns = self.store.db.execute("SELECT COUNT(*) AS used, SUM(native_started = 1 AND lease_expires_at <= ?) AS uncertain FROM agent_turns WHERE status = 'claimed'", (utc_now(),)).fetchone()
+        agent_limit = self.scheduler.max_active_turns
+        agent_reason = "native_turn_recovery_required" if turns["uncertain"] else ("agent_capacity_full" if turns["used"] >= agent_limit else None)
         return {
             "status": "running" if self.running else "starting",
             "scheduler_running": self.scheduler._started and bool(self.scheduler._loop_task and not self.scheduler._loop_task.done()),
@@ -126,6 +134,10 @@ class Runtime:
             "remote_writes": {"status": "blocked", "reason": "draft_review_and_publication_gates_not_enabled"},
             "quota_waits": [dict(row) for row in pauses],
             "task_counts": {row["state"]: row["count"] for row in counts},
+            "capacity": {
+                "agents": {"limit": agent_limit, "used": turns["used"], "blocked": agent_reason is not None, "reason": agent_reason},
+                "active_prs": self.pr_capacity.status(),
+            },
         }
 
 

@@ -10,6 +10,13 @@ import yaml
 
 
 ROLES = frozenset({"triage", "planner", "reviewer", "implementer", "ci_babysitter"})
+DEFAULT_RESOURCE_LIMIT = 5
+
+
+def resource_limit(value: Any) -> int:
+    if type(value) is not int or not 1 <= value <= 100:
+        raise ValueError("resource limits must be integers from 1 to 100")
+    return value
 
 
 @dataclass(frozen=True)
@@ -28,8 +35,10 @@ class RoleRoute:
 
 def load_config(path: Path) -> tuple[dict[str, Any], dict[str, RoleRoute]]:
     value = yaml.safe_load(path.read_text(encoding="utf-8"))
-    if not isinstance(value, dict) or set(value) - {"roles", "repositories", "worktree_root", "github_token_file", "poll_seconds", "quota_retry_seconds", "adapters", "base_prompt_file"}:
+    if not isinstance(value, dict) or set(value) - {"roles", "repositories", "worktree_root", "github_token_file", "poll_seconds", "quota_retry_seconds", "adapters", "base_prompt_file", "max_concurrent_agents", "max_open_prs"}:
         raise ValueError("runtime YAML has unsupported configuration")
+    for name in ("max_concurrent_agents", "max_open_prs"):
+        value[name] = resource_limit(value.get(name, DEFAULT_RESOURCE_LIMIT))
     raw_roles = value.get("roles")
     if not isinstance(raw_roles, Mapping) or set(raw_roles) != ROLES:
         raise ValueError("runtime YAML must configure every supported role")

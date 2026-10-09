@@ -11,6 +11,8 @@ from uuid import uuid4
 import pytest
 
 from codefactory.acp import ACPEvent, ACPSession, ACPRemoteError
+from codefactory.acp import ACPProtocolError
+from codefactory.capacity import PullRequestCapacity
 from codefactory.scheduler import Scheduler
 from codefactory.store import Store
 from codefactory.workflow import WorkflowService, role_for_state
@@ -259,3 +261,56 @@ async def test_async_commit_reader_is_authoritative_over_agent_claim(tmp_path: P
     assert updated["state"] == "CODE_REVIEW"
     assert reader_calls == [task["id"]]
     await scheduler.stop()
+
+
+@run_async_test
+async def test_full_pr_capacity_skips_new_features_and_rechecks_before_prompt(tmp_path, workflow):
+    new = admitted(workflow, 50)
+    linked = admitted(workflow, 51)
+    pulls = [SimpleNamespace(repository="acme/widget", number=number, head_ref=f"feature-{number}", base_ref="main") for number in range(1, 6)]
+    inventory = SimpleNamespace(list_active_pull_requests=lambda _repository: list(pulls))
+    capacity = PullRequestCapacity(workflow.store, ["acme/widget"])
+    capacity.refresh(inventory)
+    with workflow.store.transaction() as db:
+        db.execute("UPDATE tasks SET pull_number = 1 WHERE id = ?", (linked["id"],))
+    gateway = FakeGateway(['{"decision":"ready","summary":"Existing PR repair","risk":"low","priority":0,"questions":[]}'])
+    scheduler = Scheduler(workflow, gateway=gateway, workspace_resolver=lambda _task: tmp_path, access_policy=lambda *_args: True, capacity_policy=capacity.admit)
+    assert await scheduler.run_once()
+    assert workflow.get_session(new["id"], "triage") is None
+    assert workflow.get_task(linked["id"])["state"] == "PLAN"
+    await scheduler.stop()
+
+    # New capacity loss during session preparation must stop the actual prompt.
+    pulls.clear()
+    capacity.refresh(inventory)
+    class CapacityChanged(FakeGateway):
+        async def new_session(self, *args):
+            session = await super().new_session(*args)
+            pulls.extend(SimpleNamespace(repository="acme/widget", number=number, head_ref=f"feature-{number}", base_ref="main") for number in range(1, 6))
+            capacity.refresh(inventory)
+            return session
+    gateway = CapacityChanged([])
+    scheduler = Scheduler(workflow, gateway=gateway, workspace_resolver=lambda _task: tmp_path, access_policy=lambda *_args: True, capacity_policy=capacity.admit)
+    assert await scheduler.run_once()
+    assert gateway.prompts == []
+    assert workflow.get_task(new["id"])["state"] == "TRIAGE"
+    await scheduler.stop()
+
+
+@run_async_test
+async def test_uncertain_native_transport_holds_slot_until_adapter_shutdown(tmp_path, workflow):
+    task = admitted(workflow)
+    class LostTransport(FakeGateway):
+        async def prompt(self, *_args):
+            raise ACPProtocolError("transport lost")
+    gateway = LostTransport([])
+    scheduler = Scheduler(workflow, gateway=gateway, workspace_resolver=lambda _task: tmp_path, access_policy=lambda *_args: True, max_active_turns=1)
+    assert await scheduler.run_once()
+    with workflow.store.transaction() as db:
+        db.execute("UPDATE agent_turns SET lease_expires_at = '2000-01-01T00:00:00+00:00'")
+    assert workflow.recover_expired_turns() == 0
+    assert await scheduler.run_once() is False
+    assert workflow.get_task(task["id"])["role_failures"] == {}
+    await scheduler.stop()
+    assert gateway.closed
+    assert workflow.claim_turn(task["id"], "triage", worker_id="recovered", lease_seconds=60, max_active=1)

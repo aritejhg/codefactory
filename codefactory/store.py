@@ -180,6 +180,24 @@ class Store:
                 );
                 CREATE INDEX IF NOT EXISTS agent_turns_active
                     ON agent_turns(status, lease_expires_at);
+                CREATE TABLE IF NOT EXISTS pr_reservations (
+                    reservation_id TEXT PRIMARY KEY,
+                    repository TEXT NOT NULL COLLATE NOCASE,
+                    head TEXT NOT NULL,
+                    base TEXT NOT NULL,
+                    pull_number INTEGER,
+                    task_id INTEGER REFERENCES tasks(id),
+                    UNIQUE(repository, head, base)
+                );
+                CREATE TABLE IF NOT EXISTS feature_slots (
+                    task_id INTEGER PRIMARY KEY REFERENCES tasks(id),
+                    created_at TEXT NOT NULL
+                );
+                CREATE TABLE IF NOT EXISTS pr_inventory (
+                    singleton INTEGER PRIMARY KEY CHECK (singleton = 1),
+                    active_count INTEGER NOT NULL,
+                    verified_at TEXT NOT NULL
+                );
                 CREATE TABLE IF NOT EXISTS approvals (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
@@ -199,6 +217,12 @@ class Store:
                 );
                 """
             )
+            legacy_turns = "native_started" not in {row["name"] for row in self.db.execute("PRAGMA table_info(agent_turns)")}
+            self._add_columns("agent_turns", {"native_started": "INTEGER NOT NULL DEFAULT 0"})
+            if legacy_turns:
+                self.db.execute("UPDATE agent_turns SET native_started = 1 WHERE status = 'claimed'")
+            self._add_columns("pr_inventory", {"active_json": "TEXT NOT NULL DEFAULT '[]'"})
+            self._add_columns("pr_reservations", {"task_id": "INTEGER REFERENCES tasks(id)"})
             # Older local tasks were created by the single-operator baseline.
             # They remain owned by the explicit local principal, but retain
             # their existing trusted bit only for that operator's migration.

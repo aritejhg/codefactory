@@ -272,6 +272,7 @@ class GitHubClient:
         http_client: httpx.Client | None = None,
         token_provider: Callable[[], str] | None = None,
         timeout: float = 15.0,
+        draft_publication_gate: Callable[..., PullRequest] | None = None,
     ) -> None:
         if config.token is None and token_provider is None:
             raise GitHubConfigurationError(
@@ -280,6 +281,7 @@ class GitHubClient:
         if timeout <= 0:
             raise GitHubConfigurationError("GitHub API timeout must be positive")
         self.config = config
+        self.draft_publication_gate = draft_publication_gate
         self._token_provider = token_provider
         self._owns_client = http_client is None
         if http_client is None:
@@ -438,6 +440,25 @@ class GitHubClient:
         )
         return self._parse_pull_request(repository, response)
 
+    def list_active_pull_requests(self, repository: str) -> list[PullRequest]:
+        """Complete bounded inventory: every open draft and ready PR counts."""
+        self._require_repository(repository)
+        pulls = []
+        for page in range(1, 101):
+            response = self._request("GET", self._repo_path(repository, "pulls"), params={"state": "open", "per_page": 100, "page": page})
+            if not isinstance(response, list):
+                raise GitHubAPIError("GitHub returned an invalid active PR inventory")
+            for item in response:
+                if not isinstance(item, dict):
+                    raise GitHubAPIError("GitHub returned an invalid active PR inventory")
+                pull = self._parse_pull_request(repository, {**item, "merged": bool(item.get("merged_at"))})
+                if pull.state != "open" or pull.merged:
+                    raise GitHubAPIError("GitHub returned an inconsistent active PR inventory")
+                pulls.append(pull)
+            if len(response) < 100:
+                return pulls
+        raise GitHubAPIError("active PR inventory exceeded the pagination bound")
+
     def get_check_runs(self, repository: str, head_sha: str) -> tuple[CheckRun, ...]:
         self._require_repository(repository)
         self._require_sha(head_sha)
@@ -544,6 +565,7 @@ class GitHubClient:
         head: str,
         base: str,
         body: str = "",
+        task_id: int | None = None,
     ) -> PullRequest:
         self._require_repository(repository)
         self._require_text(title, "pull request title")
@@ -551,12 +573,12 @@ class GitHubClient:
         self._require_text(base, "pull request base")
         if not isinstance(body, str):
             raise ValueError("pull request body must be text")
-        response = self._request(
-            "POST",
-            self._repo_path(repository, "pulls"),
-            json={"title": title, "head": head, "base": base, "body": body, "draft": True},
-        )
-        return self._parse_pull_request(repository, response)
+        if self.draft_publication_gate is None:
+            raise GitHubConfigurationError("draft publication capacity gate is not configured")
+        def publish():
+            response = self._request("POST", self._repo_path(repository, "pulls"), json={"title": title, "head": head, "base": base, "body": body, "draft": True})
+            return self._parse_pull_request(repository, response)
+        return self.draft_publication_gate(self, repository, head, base, publish, task_id=task_id)
 
     def submit_pull_request_review(
         self,

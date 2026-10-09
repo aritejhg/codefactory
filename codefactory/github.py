@@ -180,6 +180,7 @@ class CIEvidence:
         return (
             has_evidence
             and legacy_status_passes
+            and all(status == "success" for _context, status in self.combined_status.contexts)
             and all(
                 run.status == "completed" and run.conclusion == "success"
                 for run in self.check_runs
@@ -319,7 +320,9 @@ class GitHubClient:
             if not isinstance(response, list):
                 raise GitHubAPIError("GitHub API returned an invalid issue list")
             for item in response:
-                if not isinstance(item, dict) or "pull_request" in item:
+                if not isinstance(item, dict):
+                    raise GitHubAPIError("GitHub API returned an invalid issue list")
+                if "pull_request" in item:
                     continue
                 parsed = self._parse_issue(repository, item)
                 if self.config.admission_label.casefold() in {
@@ -364,7 +367,7 @@ class GitHubClient:
                 raise GitHubAPIError("GitHub API returned invalid issue comments")
             for item in response:
                 if not isinstance(item, dict):
-                    continue
+                    raise GitHubAPIError("GitHub API returned invalid issue comments")
                 comment_id, body = item.get("id"), item.get("body")
                 if (
                     isinstance(comment_id, bool)
@@ -521,7 +524,7 @@ class GitHubClient:
                 raise GitHubAPIError("GitHub API returned invalid review data")
             for item in response:
                 if not isinstance(item, dict):
-                    continue
+                    raise GitHubAPIError("GitHub API returned invalid review data")
                 user = item.get("user")
                 login = user.get("login") if isinstance(user, dict) else None
                 reviews.append(

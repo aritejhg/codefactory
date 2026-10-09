@@ -13,6 +13,7 @@ import pytest
 from codefactory.github import (
     API_ORIGIN,
     CIEvidence,
+    CommitStatus,
     GitHubAPIError,
     GitHubClient,
     GitHubConfig,
@@ -455,3 +456,23 @@ def test_single_issue_fetch_requires_configured_admission_label(labels, accepted
     else:
         with pytest.raises(GitHubAPIError, match='admission label'):
             client.get_issue(REPOSITORY, 17)
+
+
+@pytest.mark.parametrize("item", [None, "malformed", 17])
+def test_issue_comments_reject_malformed_entries(item):
+    client, _ = make_client(lambda _request: httpx.Response(200, json=[item]))
+    with pytest.raises(GitHubAPIError, match="invalid issue comments"):
+        client.list_issue_comments(REPOSITORY, 17)
+
+
+@pytest.mark.parametrize("method,error", [("list_admitted_issues", "invalid issue list"), ("list_pull_request_reviews", "invalid review data")])
+def test_admission_and_review_lists_reject_malformed_evidence(method, error):
+    client, _ = make_client(lambda _request: httpx.Response(200, json=[None]))
+    with pytest.raises(GitHubAPIError, match=error):
+        getattr(client, method)(REPOSITORY, 17) if method == "list_pull_request_reviews" else getattr(client, method)(REPOSITORY)
+
+
+@pytest.mark.parametrize("context_state", ["pending", "failure", "error"])
+def test_combined_success_cannot_override_nonpassing_context(context_state):
+    evidence = CIEvidence(REPOSITORY, 17, HEAD_SHA, CommitStatus("success", (("build", context_state),)), ())
+    assert not evidence.successful

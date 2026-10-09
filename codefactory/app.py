@@ -1,3 +1,4 @@
+import json
 import os
 import sqlite3
 import threading
@@ -5,10 +6,13 @@ from contextlib import asynccontextmanager
 from datetime import datetime, timezone
 from enum import Enum
 from pathlib import Path
+from typing import Annotated
 
-from fastapi import FastAPI, HTTPException, Response
+from fastapi import FastAPI, HTTPException, Path as ApiPath, Response
 from pydantic import BaseModel, Field, field_validator
 
+MAX_SQLITE_INTEGER = 2**63 - 1
+TaskId = Annotated[int, ApiPath(gt=0, le=MAX_SQLITE_INTEGER)]
 
 class TaskState(str, Enum):
     TRIAGE = "TRIAGE"
@@ -22,7 +26,7 @@ class TaskState(str, Enum):
 
 class TaskCreate(BaseModel):
     repository: str
-    issue_number: int = Field(gt=0)
+    issue_number: int = Field(gt=0, le=MAX_SQLITE_INTEGER)
     title: str
     trusted: bool = False
 
@@ -30,6 +34,8 @@ class TaskCreate(BaseModel):
     @classmethod
     def trim_and_require_text(cls, value: str) -> str:
         value = value.strip()
+        if "\x00" in value:
+            raise ValueError("must not contain NUL characters")
         if not value:
             raise ValueError("must not be blank")
         return value
@@ -51,6 +57,15 @@ class TaskCreate(BaseModel):
 class TaskTransition(BaseModel):
     state: TaskState
     expected_state: TaskState
+    expected_revision: int = Field(ge=0, le=MAX_SQLITE_INTEGER, strict=True)
+    request_id: str = Field(min_length=1, max_length=128)
+
+    @field_validator("request_id")
+    @classmethod
+    def require_request_id(cls, value: str) -> str:
+        if not value.strip():
+            raise ValueError("request_id must not be blank")
+        return value
 
 
 TRANSITIONS = {
@@ -100,6 +115,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             title TEXT NOT NULL CHECK (length(trim(title)) > 0),
             trusted INTEGER NOT NULL CHECK (trusted IN (0, 1)),
             state TEXT NOT NULL,
+            revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0),
             created_at TEXT NOT NULL,
             updated_at TEXT NOT NULL,
             UNIQUE (repository, issue_number)
@@ -113,8 +129,27 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             created_at TEXT NOT NULL
         );
         CREATE INDEX IF NOT EXISTS events_task_id_id ON events(task_id, id);
+        CREATE TABLE IF NOT EXISTS transition_requests (
+            task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+            request_id TEXT NOT NULL,
+            expected_state TEXT NOT NULL,
+            expected_revision INTEGER NOT NULL,
+            target_state TEXT NOT NULL,
+            response_json TEXT NOT NULL,
+            PRIMARY KEY (task_id, request_id)
+        );
         """
     )
+    # Upgrade databases created by the original foundation without losing tasks.
+    db.execute("BEGIN IMMEDIATE")
+    try:
+        if "revision" not in {column["name"] for column in db.execute("PRAGMA table_info(tasks)")}:
+            db.execute("ALTER TABLE tasks ADD COLUMN revision INTEGER NOT NULL DEFAULT 0 CHECK (revision >= 0)")
+        db.execute("COMMIT")
+    except Exception:
+        db.execute("ROLLBACK")
+        db.close()
+        raise
 
     lock = threading.RLock()
 
@@ -184,7 +219,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             return [_task(row) for row in rows]
 
     @api.get("/tasks/{task_id}")
-    def get_task(task_id: int) -> dict:
+    def get_task(task_id: TaskId) -> dict:
         with lock:
             row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if row is None:
@@ -192,7 +227,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             return _task(row)
 
     @api.get("/tasks/{task_id}/events")
-    def list_events(task_id: int) -> list[dict]:
+    def list_events(task_id: TaskId) -> list[dict]:
         with lock:
             exists = db.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
             if exists is None:
@@ -203,7 +238,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             return [dict(row) for row in rows]
 
     @api.post("/tasks/{task_id}/transition")
-    def transition_task(task_id: int, payload: TaskTransition) -> dict:
+    def transition_task(task_id: TaskId, payload: TaskTransition) -> dict:
         with lock:
             db.execute("BEGIN IMMEDIATE")
             try:
@@ -211,19 +246,20 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 if row is None:
                     raise HTTPException(status_code=404, detail="task not found")
 
+                prior = db.execute(
+                    "SELECT * FROM transition_requests WHERE task_id = ? AND request_id = ?",
+                    (task_id, payload.request_id),
+                ).fetchone()
+                if prior is not None:
+                    if (prior["expected_state"], prior["expected_revision"], prior["target_state"]) != (
+                        payload.expected_state.value, payload.expected_revision, payload.state.value
+                    ):
+                        raise HTTPException(status_code=409, detail="request_id already used for a different transition")
+                    db.execute("COMMIT")
+                    return json.loads(prior["response_json"])
+                if row["revision"] != payload.expected_revision:
+                    raise HTTPException(status_code=409, detail="task revision does not match expected_revision")
                 current = TaskState(row["state"])
-                if current == payload.state:
-                    if payload.expected_state == current:
-                        db.execute("COMMIT")
-                        return _task(row)
-                    latest = db.execute(
-                        """SELECT from_state FROM events
-                           WHERE task_id = ? ORDER BY id DESC LIMIT 1""",
-                        (task_id,),
-                    ).fetchone()
-                    if latest is not None and latest["from_state"] == payload.expected_state.value:
-                        db.execute("COMMIT")
-                        return _task(row)
                 if current != payload.expected_state:
                     raise HTTPException(
                         status_code=409,
@@ -236,10 +272,12 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                     )
                 if not bool(row["trusted"]) and current == TaskState.TRIAGE:
                     raise HTTPException(status_code=409, detail="untrusted tasks must remain in TRIAGE")
+                if row["revision"] == MAX_SQLITE_INTEGER:
+                    raise HTTPException(status_code=409, detail="task revision limit reached")
 
                 now = _now()
                 db.execute(
-                    "UPDATE tasks SET state = ?, updated_at = ? WHERE id = ?",
+                    "UPDATE tasks SET state = ?, revision = revision + 1, updated_at = ? WHERE id = ?",
                     (payload.state.value, now, task_id),
                 )
                 db.execute(
@@ -248,8 +286,16 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                     (task_id, current.value, payload.state.value, now),
                 )
                 updated = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
+                result = _task(updated)
+                db.execute(
+                    """INSERT INTO transition_requests
+                       (task_id, request_id, expected_state, expected_revision, target_state, response_json)
+                       VALUES (?, ?, ?, ?, ?, ?)""",
+                    (task_id, payload.request_id, current.value, payload.expected_revision,
+                     payload.state.value, json.dumps(result)),
+                )
                 db.execute("COMMIT")
-                return _task(updated)
+                return result
             except Exception:
                 if db.in_transaction:
                     db.execute("ROLLBACK")
@@ -260,4 +306,3 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
 
 def _can_transition(current: TaskState, target: TaskState) -> bool:
     return target in TRANSITIONS.get(current, set())
-

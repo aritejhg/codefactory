@@ -68,6 +68,27 @@ class TaskTransition(BaseModel):
         return value
 
 
+class TaskRead(BaseModel):
+    id: int
+    repository: str
+    issue_number: int
+    title: str
+    trusted: bool
+    state: TaskState
+    revision: int
+    created_at: str
+    updated_at: str
+
+
+class EventRead(BaseModel):
+    id: int
+    task_id: int
+    event_type: str
+    from_state: TaskState | None
+    to_state: TaskState
+    created_at: str
+
+
 TRANSITIONS = {
     TaskState.TRIAGE: {TaskState.PLAN},
     TaskState.PLAN: {TaskState.PLAN_REVIEW},
@@ -167,7 +188,9 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
     def health() -> dict[str, str]:
         return {"status": "ok"}
 
-    @api.post("/tasks", status_code=201)
+    @api.post("/tasks", status_code=201, response_model=TaskRead,
+              response_description="New task admitted",
+              responses={200: {"model": TaskRead, "description": "Existing task returned unchanged"}})
     def create_task(payload: TaskCreate, response: Response) -> dict:
         with lock:
             db.execute("BEGIN IMMEDIATE")
@@ -212,13 +235,13 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                     db.execute("ROLLBACK")
                 raise
 
-    @api.get("/tasks")
+    @api.get("/tasks", response_model=list[TaskRead])
     def list_tasks() -> list[dict]:
         with lock:
             rows = db.execute("SELECT * FROM tasks ORDER BY id").fetchall()
             return [_task(row) for row in rows]
 
-    @api.get("/tasks/{task_id}")
+    @api.get("/tasks/{task_id}", response_model=TaskRead)
     def get_task(task_id: TaskId) -> dict:
         with lock:
             row = db.execute("SELECT * FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -226,7 +249,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
                 raise HTTPException(status_code=404, detail="task not found")
             return _task(row)
 
-    @api.get("/tasks/{task_id}/events")
+    @api.get("/tasks/{task_id}/events", response_model=list[EventRead])
     def list_events(task_id: TaskId) -> list[dict]:
         with lock:
             exists = db.execute("SELECT 1 FROM tasks WHERE id = ?", (task_id,)).fetchone()
@@ -237,7 +260,7 @@ def create_app(db_path: str | Path | None = None) -> FastAPI:
             ).fetchall()
             return [dict(row) for row in rows]
 
-    @api.post("/tasks/{task_id}/transition")
+    @api.post("/tasks/{task_id}/transition", response_model=TaskRead)
     def transition_task(task_id: TaskId, payload: TaskTransition) -> dict:
         with lock:
             db.execute("BEGIN IMMEDIATE")
